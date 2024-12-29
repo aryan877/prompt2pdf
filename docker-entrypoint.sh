@@ -1,44 +1,49 @@
 #!/bin/bash
 set -e
 
-echo "Starting LaTeX compilation..."
-
-# Debug: List contents of directories
-echo "Contents of /latex/content:"
-ls -la /latex/content
-
-# Create content directory if it doesn't exist
-mkdir -p /latex/work/content
-
-# Copy input file to work/content directory
-cp /latex/content/input.tex /latex/work/content/
-
-# Change to work directory where template is
 cd /latex/work
 
-# Run pdflatex twice to handle references
-echo "First pdflatex run..."
-pdflatex -interaction=nonstopmode latex-template.tex || {
-    echo "First pdflatex run failed. Log contents:"
-    cat latex-template.log
-    exit 1
-}
+# Copy user-provided doc.tex to the working dir
+cp /latex/content/doc.tex /latex/work/doc.tex
 
-echo "Second pdflatex run..."
-pdflatex -interaction=nonstopmode latex-template.tex || {
-    echo "Second pdflatex run failed. Log contents:"
-    cat latex-template.log
-    exit 1
-}
+LOGFILE="/latex/work/compile.log"
+echo "Starting LaTeX compilation..." > "$LOGFILE"
 
-# Check if PDF was generated
-if [ ! -f latex-template.pdf ]; then
-    echo "PDF generation failed. Log contents:"
-    cat latex-template.log
+# Run pdflatex multiple times to resolve references
+max_runs=3
+success=false
+
+for i in $(seq 1 $max_runs); do
+    echo "Compilation attempt $i of $max_runs..." >> "$LOGFILE"
+    
+    if pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1; then
+        # Run bibtex if there are citations
+        if grep -q "\\\\cite{" doc.tex || grep -q "\\\\bibliography{" doc.tex; then
+            bibtex doc >> "$LOGFILE" 2>&1 || true
+            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1
+            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1
+        fi
+        success=true
+        break
+    fi
+done
+
+if [ "$success" = false ]; then
+    echo "Error: LaTeX compilation failed after $max_runs attempts. See log below:" >> "$LOGFILE"
+    mv "$LOGFILE" /latex/output/compile.log
     exit 1
 fi
 
-# Copy the output
-cp latex-template.pdf /latex/output/output.pdf
+# If PDF compiled successfully
+if [ -f doc.pdf ]; then
+    mv doc.pdf /latex/output/output.pdf
+    echo "Compilation successful!" >> "$LOGFILE"
+    mv "$LOGFILE" /latex/output/compile.log
+else
+    echo "Error: PDF not generated despite successful compilation" >> "$LOGFILE"
+    mv "$LOGFILE" /latex/output/compile.log
+    exit 1
+fi
 
-echo "PDF generation completed successfully!" 
+# Clean auxiliary files
+rm -f *.aux *.log *.out *.toc *.bbl *.blg *.nav *.snm

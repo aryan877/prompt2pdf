@@ -10,7 +10,7 @@ export default function Home() {
       <div className="relative h-full flex flex-col p-4">
         <h1 className="text-4xl font-bold text-center mb-4 flex-none">
           <span className="bg-clip-text text-transparent bg-gradient-to-b from-white to-white/60">
-            PDFly
+            Prompt2Pdf
           </span>
         </h1>
         <div className="flex-1 min-h-0">

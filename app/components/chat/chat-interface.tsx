@@ -1,33 +1,25 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { Send, Bot, User } from "lucide-react";
+import { useState, useRef } from "react";
+import { Bot, FileDown, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { cn } from "@/lib/utils";
-import type { Message } from "@/app/types/chat";
+
+interface PDFResponse {
+  pdfUrl: string;
+  error?: string;
+}
 
 export function ChatInterface() {
-  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const textarea = e.target;
     setInput(textarea.value);
-
-    // Reset height to auto to accurately calculate scroll height
     textarea.style.height = "50px";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
   };
@@ -36,19 +28,8 @@ export function ChatInterface() {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
 
-    const newMessage: Message = {
-      id: Date.now().toString(),
-      role: "user",
-      content: input,
-      timestamp: new Date(),
-    };
-
-    setMessages((prev) => [...prev, newMessage]);
-    setInput("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "50px";
-    }
     setIsLoading(true);
+    setPdfUrl(null);
 
     try {
       const response = await fetch("/api/chat", {
@@ -56,136 +37,70 @@ export function ChatInterface() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: input }),
       });
+      const data: PDFResponse = await response.json();
 
-      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate PDF");
+      }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "assistant",
-          content: data.message,
-          timestamp: new Date(),
-          pdfUrl: data.pdfUrl,
-          type: data.type,
-        },
-      ]);
+      setPdfUrl(data.pdfUrl);
+      setInput("");
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "50px";
+      }
     } catch (error) {
       console.error("Error:", error);
+      alert("Failed to generate PDF. Please try again.");
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="flex flex-col h-full bg-black/40 rounded-2xl backdrop-blur-xl border border-white/5 max-w-5xl mx-auto w-full">
-      <div className="flex-1 overflow-y-auto p-6 space-y-8 scroll-smooth">
-        {messages.length === 0 ? (
-          <div className="h-full flex items-center justify-center">
-            <div className="text-center space-y-4">
-              <div className="w-20 h-20 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto">
-                <Bot className="w-10 h-10 text-emerald-500" />
-              </div>
-              <p className="text-zinc-400 text-lg max-w-sm">
-                Ask me anything about your PDFs
-              </p>
+    <div className="flex flex-col h-full bg-black/40 rounded-2xl backdrop-blur-xl border border-white/5 max-w-5xl mx-auto w-full p-6">
+      {/* Main content area */}
+      <div className="flex-1 flex flex-col items-center justify-center gap-6">
+        {!pdfUrl ? (
+          // Initial state or loading
+          <div className="text-center space-y-4">
+            <div className="w-20 h-20 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto">
+              <Bot className="w-10 h-10 text-emerald-500" />
             </div>
+            <p className="text-zinc-400 text-lg max-w-sm">
+              Describe what you want to create and I&apos;ll generate a PDF for
+              you
+            </p>
           </div>
         ) : (
-          <>
-            {messages.map((message, index) => (
-              <div
-                key={message.id}
-                className={cn(
-                  "flex items-start gap-4 w-full max-w-3xl mx-auto",
-                  message.role === "user" ? "flex-row-reverse" : "flex-row"
-                )}
+          // PDF download section
+          <div className="text-center space-y-6">
+            <div className="w-20 h-20 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto">
+              <FileDown className="w-10 h-10 text-emerald-500" />
+            </div>
+            <div className="space-y-2">
+              <p className="text-zinc-200 text-lg">Your PDF is ready!</p>
+              <a
+                href={pdfUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg transition-colors"
               >
-                <div className="flex flex-col items-center mt-1">
-                  <Avatar className="w-10 h-10 border-2 border-emerald-500/20">
-                    <AvatarImage
-                      src={
-                        message.role === "user"
-                          ? "/user-avatar.png"
-                          : "/bot-avatar.png"
-                      }
-                    />
-                    <AvatarFallback className="bg-emerald-500/10 text-emerald-500">
-                      {message.role === "user" ? "You" : "AI"}
-                    </AvatarFallback>
-                  </Avatar>
-                </div>
-
-                <div className="flex flex-col gap-2 flex-1">
-                  <div
-                    className={cn(
-                      "px-6 py-3.5 rounded-2xl text-base leading-relaxed shadow-md",
-                      message.role === "user"
-                        ? "bg-emerald-500 text-white rounded-tr-none ml-auto"
-                        : "bg-zinc-800/70 text-zinc-100 rounded-tl-none border border-white/10 mr-auto"
-                    )}
-                  >
-                    {message.content}
-                  </div>
-                  {message.role === "assistant" && message.pdfUrl && (
-                    <a
-                      href={message.pdfUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-2 text-sm text-emerald-500 hover:text-emerald-400 transition-colors mt-1"
-                    >
-                      <svg
-                        className="w-5 h-5"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="2"
-                          d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                        />
-                      </svg>
-                      Download Solution PDF
-                    </a>
-                  )}
-                </div>
-              </div>
-            ))}
-            {isLoading && (
-              <div className="flex items-start gap-4 w-full max-w-3xl mx-auto">
-                <div className="flex flex-col items-center mt-1">
-                  <Avatar className="w-10 h-10 border-2 border-emerald-500/20">
-                    <AvatarImage src="/bot-avatar.png" />
-                    <AvatarFallback className="bg-emerald-500/10 text-emerald-500">
-                      AI
-                    </AvatarFallback>
-                  </Avatar>
-                </div>
-                <div className="flex flex-col gap-2 flex-1">
-                  <div className="px-6 py-3.5 rounded-2xl text-base leading-relaxed shadow-md bg-zinc-800/70 text-zinc-100 rounded-tl-none border border-white/10 mr-auto w-24">
-                    <div className="flex gap-1">
-                      <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.3s]" />
-                      <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.15s]" />
-                      <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-          </>
+                <FileDown className="w-5 h-5" />
+                Download PDF
+              </a>
+            </div>
+          </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
-      <div className="shrink-0 p-6 border-t border-white/5 bg-black/20">
+      {/* Input area */}
+      <div className="shrink-0 mt-6">
         <form onSubmit={handleSubmit} className="flex gap-3 max-w-3xl mx-auto">
           <Textarea
             ref={textareaRef}
             value={input}
             onChange={handleTextareaChange}
-            placeholder="Ask a question..."
+            placeholder="Describe what content you want to create..."
             className="min-h-[56px] max-h-[200px] resize-none bg-white/5 border-0 focus:ring-1 focus:ring-emerald-500/50 rounded-xl placeholder:text-zinc-400 text-base"
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
@@ -205,9 +120,9 @@ export function ChatInterface() {
             )}
           >
             {isLoading ? (
-              <div className="animate-spin rounded-full h-6 w-6 border-2 border-white border-t-transparent" />
+              <Loader2 className="w-6 h-6 animate-spin" />
             ) : (
-              <Send className="h-6 w-6" />
+              <FileDown className="w-6 h-6" />
             )}
           </Button>
         </form>
