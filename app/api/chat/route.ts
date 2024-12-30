@@ -11,6 +11,9 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import OpenAI from "openai";
+import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs";
+import { cookies } from "next/headers";
+import { supabase } from "@/lib/supabase";
 
 const execAsync = promisify(exec);
 
@@ -31,6 +34,15 @@ const s3Client = new S3Client({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
   },
 });
+
+interface CompilationResult {
+  pdfBuffer?: Buffer;
+  error?: {
+    message: string;
+    details?: string;
+    latexLog?: string;
+  };
+}
 
 /**
  * 1) Extract the LaTeX doc from GPT’s response.
@@ -190,106 +202,87 @@ function sanitizeLatex(input: string): string {
 }
 
 /**
- * 3) Auto-define languages used in \lstlisting to avoid "Couldn't load language"
- *    We'll scan for e.g. [language=rust], [language=plaintext], etc.,
- *    and create a fallback definition for each one found.
- */
-function autoDefineLanguages(tex: string): string {
-  // 1) Gather all unique [language=XYZ]
-  const langRegex = /\[language=([^\]]+)\]/g;
-  const langs = new Set<string>();
-  let match;
-  while ((match = langRegex.exec(tex)) !== null) {
-    langs.add(match[1]);
-  }
-
-  if (langs.size === 0) {
-    return tex; // no custom languages used
-  }
-
-  // 2) Build fallback definitions for each language
-  //    We'll define them as a minimal style so LaTeX won't choke.
-  let definitions = "";
-  langs.forEach((lang) => {
-    definitions += `
-% Auto-defined fallback for language=${lang}
-\\lstdefinelanguage{${lang}}{
-  keywordstyle=\\bfseries,
-  basicstyle=\\ttfamily,
-  comment=[l]{//},
-  morecomment=[s]{/*}{*/},
-  morestring=[b]",
-  sensitive=true
-}
-`;
-  });
-
-  // 3) Insert these definitions into the preamble (after \usepackage{listings})
-  //    We'll do a naive approach:
-  const useListingsRegex = /\\usepackage(\[.*?\])?\{listings\}/;
-  const listingsMatch = tex.match(useListingsRegex);
-  if (!listingsMatch || !listingsMatch.index) {
-    // If for some reason we can't find \usepackage{listings}, just prepend
-    return definitions + "\n" + tex;
-  }
-
-  // Insert right after \usepackage{listings}
-  const insertPos = listingsMatch.index + listingsMatch[0].length;
-  return (
-    tex.slice(0, insertPos) + "\n" + definitions + "\n" + tex.slice(insertPos)
-  );
-}
-
-/**
  * 4) Compile .tex in Docker
  */
-async function compileLatex(fullLatex: string): Promise<{
-  pdfBuffer?: Buffer;
-  log?: string;
-}> {
-  // Temporary dir
+async function compileLatex(tex: string): Promise<CompilationResult> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "latex-"));
 
   try {
-    // Make content + output dirs
+    // Create directories and write tex file
     await fs.mkdir(path.join(tempDir, "content"), { recursive: true });
     await fs.mkdir(path.join(tempDir, "output"), { recursive: true });
 
-    // Save doc.tex
-    const docPath = path.join(tempDir, "content", "doc.tex");
-    await fs.writeFile(docPath, fullLatex, "utf-8");
+    const texFile = path.join(tempDir, "content", "doc.tex");
+    await fs.writeFile(texFile, tex, "utf-8");
 
-    // Docker compile
-    const dockerCmd = `docker run --rm \
-      -v "${path.join(tempDir, "content")}:/latex/content:ro" \
-      -v "${path.join(tempDir, "output")}:/latex/output" \
-      latex-service`;
-
-    try {
-      const { stdout, stderr } = await execAsync(dockerCmd);
-      console.log("Docker stdout:", stdout);
-      console.warn("Docker stderr:", stderr);
-    } catch (err) {
-      console.error("Docker compile failed:", err);
-      // Check for compile.log
-      const logPath = path.join(tempDir, "output", "compile.log");
-      if (await fs.stat(logPath).catch(() => false)) {
-        const logData = await fs.readFile(logPath, "utf-8");
-        return { pdfBuffer: undefined, log: logData };
-      }
+    // Verify the file was written
+    const fileContent = await fs.readFile(texFile, "utf-8");
+    if (!fileContent) {
       return {
-        pdfBuffer: undefined,
-        log: "LaTeX compilation failed (no log found).",
+        error: {
+          message: "Failed to write LaTeX file",
+          details: "The LaTeX content could not be written to disk",
+        },
       };
     }
 
-    // If compiled, read output.pdf
+    try {
+      // Run Docker compilation with absolute paths
+      const contentPath = path.resolve(path.join(tempDir, "content"));
+      const outputPath = path.resolve(path.join(tempDir, "output"));
+
+      const dockerCmd = `docker run --rm \
+        -v "${contentPath}:/latex/content:ro" \
+        -v "${outputPath}:/latex/output" \
+        latex-service`;
+
+      console.log("Running Docker command:", dockerCmd);
+
+      const { stdout, stderr } = await execAsync(dockerCmd);
+      console.log("Docker stdout:", stdout);
+      console.warn("Docker stderr:", stderr);
+    } catch (error: any) {
+      console.error("Docker compilation error:", error);
+
+      // Try to read the log file even if Docker command failed
+      const logPath = path.join(tempDir, "output", "compile.log");
+      let logContent;
+      try {
+        logContent = await fs.readFile(logPath, "utf-8");
+      } catch (logError) {
+        logContent = "No compilation log available";
+      }
+
+      return {
+        error: {
+          message: "LaTeX compilation failed",
+          details: `Docker Error: ${error?.message || "Unknown error"}`,
+          latexLog: logContent,
+        },
+      };
+    }
+
+    // Check for PDF
     const pdfPath = path.join(tempDir, "output", "output.pdf");
-    const pdfBuffer = await fs.readFile(pdfPath);
-    return { pdfBuffer, log: undefined };
+    if (await fs.stat(pdfPath).catch(() => false)) {
+      const pdfBuffer = await fs.readFile(pdfPath);
+      return { pdfBuffer };
+    }
+
+    // If no PDF was generated, try to get the log
+    const logPath = path.join(tempDir, "output", "compile.log");
+    const logContent = await fs.readFile(logPath, "utf-8").catch(() => null);
+
+    return {
+      error: {
+        message: "LaTeX compilation failed",
+        details: "No PDF was generated",
+        latexLog: logContent || "No compilation log available",
+      },
+    };
   } finally {
-    // Cleanup
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // Clean up temp directory
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(console.error);
   }
 }
 
@@ -297,94 +290,125 @@ async function compileLatex(fullLatex: string): Promise<{
  * Next.js route
  */
 export async function POST(req: Request) {
+  const supabase = createRouteHandlerClient({ cookies });
+
+  // Check authentication
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     const { message } = await req.json();
-    if (!message) {
-      return NextResponse.json(
-        { error: "Message is required" },
-        { status: 400 }
-      );
-    }
 
-    // 1) Ask GPT for full doc
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
           role: "system",
-          content: `
-You are Overleaf itself.
+          content: `You are a LaTeX expert. Convert the user's request into a complete, compilable LaTeX document.
 
 Guidelines:
-1. Output ONLY a complete LaTeX file, from \\documentclass to \\end{document}.
-2. Avoid minted or shell-escape references.
-3. If user wants code in a given language, use \\lstlisting with [language=XYZ].
-4. No extra text or code fences (like \`\`\`latex).
-5. End with \\end{document}.
-6. For bold text, use \\textbf{} instead of markdown-style ** or *.
-7. For mathematical expressions, use proper LaTeX math mode with $ or $$ delimiters.
-8. For matrices, use the \\begin{matrix} or \\begin{pmatrix} environment.
-9. For enumerated lists, use \\begin{enumerate} with \\item.
-          `,
+1. Always start with:
+   \\documentclass{article}
+   \\usepackage[utf8]{inputenc}
+   \\usepackage[T1]{fontenc}
+   \\usepackage{amsmath,amssymb}
+   \\usepackage{graphicx}
+
+2. For text formatting:
+   - Bold: \\textbf{text}
+   - Italic: \\textit{text}
+   - Code: \\begin{verbatim}...\\end{verbatim}
+
+3. For math:
+   - Inline math: $...$ 
+   - Display math: \\[...\\] or $$...$$
+   - Matrices: \\begin{pmatrix}...\\end{pmatrix}
+   - Aligned equations: \\begin{align*}...\\end{align*}
+
+4. Document structure:
+   - Always include \\begin{document} and \\end{document}
+   - Use \\section{} for main sections
+   - Use \\subsection{} for subsections
+   - Use itemize/enumerate for lists
+
+5. Output ONLY the complete LaTeX code with no explanations or markdown`,
         },
-        {
-          role: "user",
-          content: message.replace(/\*\*(.*?)\*\*/g, "\\textbf{$1}"),
-        },
+        { role: "user", content: message },
       ],
       temperature: 0.3,
     });
 
-    const gptResponse = completion.choices[0].message?.content || "";
-    if (!gptResponse) {
-      throw new Error("GPT returned an empty LaTeX document");
+    const tex = completion.choices[0].message?.content || "";
+    if (!tex) {
+      throw new Error("Failed to generate LaTeX");
     }
 
-    // 2) Extract doc
-    let tex = extractLaTeXFromGPT(gptResponse);
-
-    // 3) Sanitize doc (remove minted, unknown packages, ensure doc structure)
-    tex = sanitizeLatex(tex);
-
-    // 4) Auto-define any custom [language=XYZ]
-    tex = autoDefineLanguages(tex);
-
-    // 5) Compile
-    const { pdfBuffer, log } = await compileLatex(tex);
-    if (!pdfBuffer) {
+    const result = await compileLatex(tex);
+    if (result.error) {
       return NextResponse.json(
-        { error: "LaTeX compilation failed", log },
+        {
+          error: result.error.message,
+          details: result.error.details,
+          latexLog: result.error.latexLog,
+          generatedTex: tex, // Include the generated LaTeX for debugging
+        },
         { status: 500 }
       );
     }
 
-    // 6) Upload PDF to S3
     const key = `pdfs/${Date.now()}.pdf`;
     await s3Client.send(
       new PutObjectCommand({
         Bucket: process.env.AWS_BUCKET_NAME!,
         Key: key,
-        Body: pdfBuffer,
+        Body: result.pdfBuffer,
         ContentType: "application/pdf",
       })
     );
 
-    // 7) Generate signed URL
     const command = new GetObjectCommand({
       Bucket: process.env.AWS_BUCKET_NAME!,
       Key: key,
     });
     const pdfUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
 
-    // Return final doc + PDF link
-    return NextResponse.json({
-      pdfUrl,
-      fullLatex: tex,
+    // After successful PDF generation and upload to S3, store in Supabase
+    const { error: dbError } = await supabase.from("pdf_generations").insert({
+      user_id: session.user.id,
+      prompt: message,
+      pdf_url: pdfUrl, // This should be the S3 URL from your existing code
+      status: "success",
     });
+
+    if (dbError) throw dbError;
+
+    return NextResponse.json({ pdfUrl });
   } catch (error: any) {
-    console.error("Error in /api/chat (LaTeX full doc):", error);
+    console.error("Error:", error);
+
+    // If there's an error, try to log it in the database if we have a user ID
+    if (session?.user?.id) {
+      try {
+        await supabase.from("pdf_generations").insert({
+          user_id: session.user.id,
+          prompt: error.message || "Unknown error",
+          pdf_url: "",
+          status: "error",
+        });
+      } catch (dbError) {
+        console.error("Failed to log error to database:", dbError);
+      }
+    }
+
     return NextResponse.json(
-      { error: error.message || "Unknown error" },
+      {
+        error: "Failed to generate PDF",
+        details: error.message,
+      },
       { status: 500 }
     );
   }

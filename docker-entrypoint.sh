@@ -3,25 +3,28 @@ set -e
 
 cd /latex/work
 
-# Copy user-provided doc.tex to the working dir
-cp /latex/content/doc.tex /latex/work/doc.tex
+echo "Starting LaTeX compilation..." > /latex/output/compile.log
 
-LOGFILE="/latex/work/compile.log"
-echo "Starting LaTeX compilation..." > "$LOGFILE"
+# Copy user-provided doc.tex to the working dir
+if ! cp /latex/content/doc.tex /latex/work/doc.tex; then
+    echo "Failed to copy LaTeX file" >> /latex/output/compile.log
+    exit 1
+fi
 
 # Run pdflatex multiple times to resolve references
 max_runs=3
 success=false
 
 for i in $(seq 1 $max_runs); do
-    echo "Compilation attempt $i of $max_runs..." >> "$LOGFILE"
+    echo "Compilation attempt $i of $max_runs..." >> /latex/output/compile.log
     
-    if pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1; then
+    if pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> /latex/output/compile.log 2>&1; then
         # Run bibtex if there are citations
         if grep -q "\\\\cite{" doc.tex || grep -q "\\\\bibliography{" doc.tex; then
-            bibtex doc >> "$LOGFILE" 2>&1 || true
-            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1
-            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> "$LOGFILE" 2>&1
+            echo "Running BibTeX..." >> /latex/output/compile.log
+            bibtex doc >> /latex/output/compile.log 2>&1 || true
+            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> /latex/output/compile.log 2>&1
+            pdflatex -interaction=nonstopmode -halt-on-error doc.tex >> /latex/output/compile.log 2>&1
         fi
         success=true
         break
@@ -29,19 +32,16 @@ for i in $(seq 1 $max_runs); do
 done
 
 if [ "$success" = false ]; then
-    echo "Error: LaTeX compilation failed after $max_runs attempts. See log below:" >> "$LOGFILE"
-    mv "$LOGFILE" /latex/output/compile.log
+    echo "Error: LaTeX compilation failed after $max_runs attempts." >> /latex/output/compile.log
     exit 1
 fi
 
 # If PDF compiled successfully
 if [ -f doc.pdf ]; then
     mv doc.pdf /latex/output/output.pdf
-    echo "Compilation successful!" >> "$LOGFILE"
-    mv "$LOGFILE" /latex/output/compile.log
+    echo "Compilation successful!" >> /latex/output/compile.log
 else
-    echo "Error: PDF not generated despite successful compilation" >> "$LOGFILE"
-    mv "$LOGFILE" /latex/output/compile.log
+    echo "Error: PDF not generated despite successful compilation" >> /latex/output/compile.log
     exit 1
 fi
 
