@@ -4,31 +4,17 @@ import type { NextRequest } from "next/server";
 
 export async function middleware(req: NextRequest) {
   const res = NextResponse.next();
-
-  // Skip auth check for auth callback route
-  if (req.nextUrl.pathname.startsWith("/api/auth/callback")) {
-    return res;
-  }
-
-  const supabase = createMiddlewareClient({
-    req,
-    res,
-  });
+  const supabase = createMiddlewareClient({ req, res });
 
   const {
     data: { session },
   } = await supabase.auth.getSession();
 
-  // If no session and trying to access protected routes
-  if (
-    !session &&
-    (req.nextUrl.pathname === "/" ||
-      req.nextUrl.pathname.startsWith("/generations") ||
-      req.nextUrl.pathname.startsWith("/api/chat"))
-  ) {
+  // If no session, redirect to login except for login page
+  if (!session && req.nextUrl.pathname !== "/login") {
     const redirectUrl = req.nextUrl.clone();
     redirectUrl.pathname = "/login";
-    redirectUrl.searchParams.set(`redirectedFrom`, req.nextUrl.pathname);
+    redirectUrl.searchParams.set("redirectedFrom", req.nextUrl.pathname);
     return NextResponse.redirect(redirectUrl);
   }
 
@@ -38,12 +24,13 @@ export async function middleware(req: NextRequest) {
 export const config = {
   matcher: [
     /*
-     * Match all request paths except:
+     * Match all request paths except for the ones starting with:
      * - _next/static (static files)
      * - _next/image (image optimization files)
      * - favicon.ico (favicon file)
-     * - public folder
+     * - public (public files)
+     * - auth (auth endpoints)
      */
-    "/((?!_next/static|_next/image|favicon.ico|public/).*)",
+    "/((?!_next/static|_next/image|favicon.ico|public|auth).*)",
   ],
 };

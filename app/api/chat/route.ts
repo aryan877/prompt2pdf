@@ -13,7 +13,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import OpenAI from "openai";
 import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs";
 import { cookies } from "next/headers";
-import { supabase } from "@/lib/supabase";
+import { rateLimitMiddleware } from "@/lib/rate-limit";
 
 const execAsync = promisify(exec);
 
@@ -45,174 +45,18 @@ interface CompilationResult {
 }
 
 /**
- * 1) Extract the LaTeX doc from GPT’s response.
- *    - Strips code fences ```latex ... ```
- *    - Finds \documentclass... up to \end{document}
- */
-function extractLaTeXFromGPT(response: string): string {
-  // Try code fence first
-  const codeBlockRegex = /```latex\s([\s\S]*?)```/i;
-  const fenceMatch = response.match(codeBlockRegex);
-  if (fenceMatch && fenceMatch[1]) {
-    const insideFences = fenceMatch[1].trim();
-    // If there's random text before \documentclass, strip it
-    if (!insideFences.startsWith("\\documentclass")) {
-      const idx = insideFences.indexOf("\\documentclass");
-      if (idx !== -1) {
-        return insideFences.substring(idx).trim();
-      }
-    }
-    return insideFences;
-  }
-
-  // Otherwise, look for \documentclass
-  const docIndex = response.indexOf("\\documentclass");
-  if (docIndex === -1) {
-    // GPT gave no \documentclass at all
-    return response.trim();
-  }
-
-  // Find \end{document}
-  const endDocIndex = response.indexOf("\\end{document}", docIndex);
-  if (endDocIndex !== -1) {
-    return response.substring(docIndex, endDocIndex + 14).trim();
-  }
-
-  // If no \end{document}, return from docclass onward
-  return response.substring(docIndex).trim();
-}
-
-/**
- * 2) Basic LaTeX sanitation
- *    - Remove minted / shell-escape
- *    - Remove unknown packages (optional)
- *    - Ensure we have \usepackage{listings} if GPT forgot
- *    - Ensure we have \begin{document} / \end{document} if GPT forgot
- */
-function sanitizeLatex(input: string): string {
-  let tex = input;
-
-  // First ensure we have a proper document class
-  if (!tex.includes("\\documentclass")) {
-    tex = "\\documentclass{article}\n" + tex;
-  }
-
-  // Add essential packages at the start
-  const essentialPackages = `
-\\usepackage[utf8]{inputenc}
-\\usepackage[T1]{fontenc}
-\\usepackage{lmodern}
-\\usepackage{textcomp}
-\\usepackage{listings}
-\\usepackage{xcolor}
-\\usepackage{graphicx}
-\\usepackage{amsmath}
-\\usepackage{amssymb}
-`;
-
-  // Insert essential packages after documentclass
-  const docClassMatch = tex.match(/\\documentclass(\[.*?\])?\{.*?\}/);
-  if (docClassMatch) {
-    const insertPos = docClassMatch.index! + docClassMatch[0].length;
-    tex =
-      tex.slice(0, insertPos) + "\n" + essentialPackages + tex.slice(insertPos);
-  }
-
-  // Remove problematic packages and commands
-  tex = tex.replace(/\\usepackage(\[.*?\])?\{minted\}/g, "% removed minted");
-  tex = tex.replace(/-shell-escape/g, "");
-  tex = tex.replace(/\\usepackage\{.*?tikz.*?\}/g, "% removed tikz");
-  tex = tex.replace(/\\usepackage\{.*?pgf.*?\}/g, "% removed pgf");
-  tex = tex.replace(
-    /\\begin\{tikzpicture\}[\s\S]*?\\end\{tikzpicture\}/g,
-    "% removed tikz content"
-  );
-
-  // (Optional) known packages only
-  // If you want to remove ANY unknown packages:
-  const knownPackages = [
-    "amsmath",
-    "amssymb",
-    "geometry",
-    "listings",
-    "graphicx",
-    "color",
-    "xcolor",
-    "hyperref",
-    "url",
-    "float",
-    "caption",
-    "subcaption",
-    "enumitem",
-    "array",
-    "tabularx",
-    "booktabs",
-    "multirow",
-    "longtable",
-    "wrapfig",
-    "fancyhdr",
-    "lastpage",
-    "titlesec",
-    "inputenc",
-    "fontenc",
-    "lmodern",
-    "textcomp",
-    "mathtools",
-  ];
-  tex = tex.replace(
-    /\\usepackage(\[.*?\])?\{([^}]+)\}/g,
-    (fullMatch: string, opts: string, pkgNames: string) => {
-      const pkgs: string[] = pkgNames.split(",").map((p: string) => p.trim());
-      // Keep line only if every package is known
-      const keep = pkgs.every((p: string) => knownPackages.includes(p));
-      return keep ? fullMatch : `% removed unknown package(s): ${pkgNames}`;
-    }
-  );
-
-  // If there's no \usepackage{listings}, we add it in the preamble
-  if (!/\\usepackage(\[.*?\])?\{listings\}/.test(tex)) {
-    // naive approach: insert after \documentclass line
-    const docclassMatch = tex.match(/\\documentclass(\[.*?\])?\{.*?\}/);
-    if (docclassMatch) {
-      const insertPos = docclassMatch.index! + docclassMatch[0].length;
-      tex =
-        tex.slice(0, insertPos) +
-        "\n\\usepackage{listings}\n" +
-        tex.slice(insertPos);
-    } else {
-      // If GPT forgot \documentclass entirely, wrap the entire doc
-      tex =
-        "\\documentclass{article}\n\\usepackage{listings}\n\\begin{document}\n" +
-        tex +
-        "\n\\end{document}";
-    }
-  }
-
-  // Ensure we have \begin{document} ... \end{document}
-  if (!tex.includes("\\begin{document}")) {
-    // We'll guess a spot (end of preamble) to insert \begin{document}
-    // For simplicity, just append it if missing
-    tex = tex + "\n\\begin{document}\n";
-  }
-  if (!tex.includes("\\end{document}")) {
-    tex = tex + "\n\\end{document}\n";
-  }
-
-  return tex;
-}
-
-/**
- * 4) Compile .tex in Docker
+ * 4) Compile .tex directly using system LaTeX
  */
 async function compileLatex(tex: string): Promise<CompilationResult> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "latex-"));
+  const workDir = path.join(tempDir, "work");
 
   try {
-    // Create directories and write tex file
-    await fs.mkdir(path.join(tempDir, "content"), { recursive: true });
-    await fs.mkdir(path.join(tempDir, "output"), { recursive: true });
+    // Create work directory
+    await fs.mkdir(workDir, { recursive: true });
 
-    const texFile = path.join(tempDir, "content", "doc.tex");
+    // Write tex file
+    const texFile = path.join(workDir, "doc.tex");
     await fs.writeFile(texFile, tex, "utf-8");
 
     // Verify the file was written
@@ -227,25 +71,24 @@ async function compileLatex(tex: string): Promise<CompilationResult> {
     }
 
     try {
-      // Run Docker compilation with absolute paths
-      const contentPath = path.resolve(path.join(tempDir, "content"));
-      const outputPath = path.resolve(path.join(tempDir, "output"));
+      // Change to work directory for compilation
+      const currentDir = process.cwd();
+      process.chdir(workDir);
 
-      const dockerCmd = `docker run --rm \
-        -v "${contentPath}:/latex/content:ro" \
-        -v "${outputPath}:/latex/output" \
-        latex-service`;
+      // Run pdflatex
+      const { stdout, stderr } = await execAsync(
+        "pdflatex -interaction=nonstopmode -halt-on-error doc.tex"
+      );
+      console.log("LaTeX stdout:", stdout);
+      console.warn("LaTeX stderr:", stderr);
 
-      console.log("Running Docker command:", dockerCmd);
-
-      const { stdout, stderr } = await execAsync(dockerCmd);
-      console.log("Docker stdout:", stdout);
-      console.warn("Docker stderr:", stderr);
+      // Change back to original directory
+      process.chdir(currentDir);
     } catch (error: any) {
-      console.error("Docker compilation error:", error);
+      console.error("LaTeX compilation error:", error);
 
-      // Try to read the log file even if Docker command failed
-      const logPath = path.join(tempDir, "output", "compile.log");
+      // Try to read the log file
+      const logPath = path.join(workDir, "doc.log");
       let logContent;
       try {
         logContent = await fs.readFile(logPath, "utf-8");
@@ -256,21 +99,21 @@ async function compileLatex(tex: string): Promise<CompilationResult> {
       return {
         error: {
           message: "LaTeX compilation failed",
-          details: `Docker Error: ${error?.message || "Unknown error"}`,
+          details: `Error: ${error?.message || "Unknown error"}`,
           latexLog: logContent,
         },
       };
     }
 
     // Check for PDF
-    const pdfPath = path.join(tempDir, "output", "output.pdf");
+    const pdfPath = path.join(workDir, "doc.pdf");
     if (await fs.stat(pdfPath).catch(() => false)) {
       const pdfBuffer = await fs.readFile(pdfPath);
       return { pdfBuffer };
     }
 
     // If no PDF was generated, try to get the log
-    const logPath = path.join(tempDir, "output", "compile.log");
+    const logPath = path.join(workDir, "doc.log");
     const logContent = await fs.readFile(logPath, "utf-8").catch(() => null);
 
     return {
@@ -290,7 +133,8 @@ async function compileLatex(tex: string): Promise<CompilationResult> {
  * Next.js route
  */
 export async function POST(req: Request) {
-  const supabase = createRouteHandlerClient({ cookies });
+  const cookieStore = cookies();
+  const supabase = createRouteHandlerClient({ cookies: () => cookieStore });
 
   // Check authentication
   const {
@@ -298,6 +142,16 @@ export async function POST(req: Request) {
   } = await supabase.auth.getSession();
   if (!session) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Apply rate limiting (5 requests per minute per user)
+  const rateLimitResult = await rateLimitMiddleware(req, session.user.id, {
+    interval: 60, // 1 minute
+    limit: 5, // 5 requests
+  });
+
+  if (rateLimitResult) {
+    return rateLimitResult;
   }
 
   try {
